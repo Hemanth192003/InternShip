@@ -80,143 +80,76 @@
 
 
 
-# Connect Paper 
+# LLM Code
 
 import requests
 from bs4 import BeautifulSoup
 from pymongo import MongoClient
-from datetime import datetime
-from fuzzywuzzy import process
-import time
+from transformers import pipeline
 
 # MongoDB connection setup
 client = MongoClient("mongodb://localhost:27017/")
 db = client['ResearchDB']
-log_collection = db['ScrapingLogs']  # Single collection for all sources
+log_collection = db['ScrapingLogs']
 
-# Function to scrape Google Scholar
-def scrape_google_scholar(topic, field):
-    base_url = "https://scholar.google.com/scholar"
-    query = f"{topic} {field}"  # Combine topic and field for search query
-    params = {"q": query, "hl": "en"}
-    response = requests.get(base_url, params=params)
+# Load the summarization model
+summarizer = pipeline("summarization", model="facebook/bart-large-cnn")  # Example free model
 
-    if response.status_code == 200:
-        soup = BeautifulSoup(response.text, "html.parser")
-        results = []
-        for item in soup.select(".gs_ri"):
-            title = item.select_one(".gs_rt").text if item.select_one(".gs_rt") else "No Title"
-            link = item.select_one(".gs_rt a")['href'] if item.select_one(".gs_rt a") else "No Link"
-            author_info = item.select_one(".gs_a").text if item.select_one(".gs_a") else "No Author Info"
-            results.append({
-                "title": title,
-                "link": link,
-                "author_info": author_info,
-                "field": field,  # Include field in the scraped data
-                "source": "Google Scholar"  # Add source for segregation
-            })
-        return results
-    else:
-        print(f"Failed to fetch data from Google Scholar. Status code: {response.status_code}")
-        return []
-
-# Function to scrape ResearchGate
-def scrape_researchgate(topic):
-    base_url = f"https://www.researchgate.net/search/publication?q={topic.replace(' ', '%20')}"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.9"
-    }
-
-    session = requests.Session()
-    session.headers.update(headers)
-
+# Function to fetch content from a URL
+def fetch_content(url):
     try:
-        response = session.get(base_url)
+        response = requests.get(url)
         if response.status_code == 200:
             soup = BeautifulSoup(response.text, "html.parser")
-            results = []
-            for result in soup.select(".nova-o-stack__item"):
-                title = result.select_one(".nova-e-text--spacing-none").text.strip() if result.select_one(".nova-e-text--spacing-none") else "No Title"
-                link = result.select_one("a")['href'] if result.select_one("a") else "No Link"
-                link = f"https://www.researchgate.net{link}" if "http" not in link else link
-                results.append({
-                    "title": title,
-                    "link": link,
-                    "author_info": "Not Available",  # ResearchGate doesn't offer author info directly
-                    "field": "Not Specified",
-                    "source": "ResearchGate"  # Add source for segregation
-                })
-            return results
+            # Extract main content (adjust selector based on website structure)
+            paragraphs = soup.find_all("p")
+            content = " ".join([para.text for para in paragraphs])
+            return content
         else:
-            print(f"Failed to fetch data from ResearchGate. Status code: {response.status_code}")
-            return []
+            print(f"Failed to fetch content from {url}. Status code: {response.status_code}")
+            return None
     except Exception as e:
-        print(f"An error occurred: {e}")
-        return []
+        print(f"An error occurred while fetching content: {e}")
+        return None
 
-# Function to remove duplicates using FuzzyWuzzy
-def remove_duplicates(data):
-    # unique_titles = []
-    # filtered_data = []
-    # for entry in data:
-    #     title = entry['title']
-    #     if not any(process.extractOne(title, unique_titles, score_cutoff=90)):
-    #         unique_titles.append(title)
-    #         filtered_data.append(entry)
-    return data
+# Function to summarize content based on user prompt
+def summarize_content(prompt, content):
+    try:
+        # Combine user prompt with content
+        input_text = f"{prompt}\n\n{content}"
+        summary = summarizer(input_text, max_length=150, min_length=50, do_sample=False)
+        return summary[0]['summary_text']
+    except Exception as e:
+        print(f"An error occurred during summarization: {e}")
+        return "Unable to generate summary."
 
-# Function to log data into MongoDB with nested structure
-def log_nested_data(scraped_data):
-    # Create a dictionary to organize data by source
-    sources = {}
+# Main workflow to fetch prompt and summarize papers from nested JSON
+def process_logs_and_summarize():
+    # Take the user's prompt
+    user_prompt = input("Enter your prompt for summarization: ")
 
-    for entry in scraped_data:
-        source = entry.get('source', "Unknown")
-        if source not in sources:
-            sources[source] = []  # Initialize source as a list of entries
-        sources[source].append({
-            "timestamp": datetime.utcnow().isoformat(),
-            "title": entry['title'],  # Scraped title
-            "link": entry['link'],  # Scraped link
-            "author_info": entry.get('author_info', "Not Available"),  # Authors
-            "field": entry.get('field', "Not Specified")  # Research field
-        })
+    # Fetch all logs from MongoDB
+    logs = log_collection.find()
+    for log in logs:
+        sources = log.get("source", {})  # Get the nested source structure
 
-    # Create the final JSON document with nested "source" field
-    final_log = {
-        "source": sources  # Nested source-based structure
-    }
+        for source_name, papers in sources.items():
+            print(f"\nProcessing papers from source: {source_name}")
+            for paper in papers:
+                title = paper.get("title", "No Title")
+                link = paper.get("link", None)
 
-    # Insert the final log into MongoDB
-    log_collection.insert_one(final_log)
-    print("Logged nested data structure into MongoDB!")
+                print(f"\nProcessing paper: {title}")
+                if link:
+                    content = fetch_content(link)
+                    if content:
+                        summary = summarize_content(user_prompt, content)
+                        print(f"Summary for '{title}':\n{summary}\n")
+                    else:
+                        print(f"Content not available for '{title}'.")
+                else:
+                    print(f"No valid link for '{title}'.")
 
-# Main Execution Workflow
+# Example Usage
 if __name__ == "__main__":
-    topic = "Heart Disease Prediction"  # Example topic
-    field = "Medical"  # Example field
-
-    all_scraped_data = []
-
-    # Scrape Google Scholar
-    print(f"Scraping Google Scholar for topic: {topic} and field: {field}...")
-    google_scholar_data = scrape_google_scholar(topic, field)
-    if google_scholar_data:
-        print(f"Removing duplicates from Google Scholar data...")
-        google_scholar_deduped = remove_duplicates(google_scholar_data)
-        all_scraped_data.extend(google_scholar_deduped)
-
-    # Scrape ResearchGate
-    print(f"Scraping ResearchGate for topic: {topic}...")
-    researchgate_data = scrape_researchgate(topic)
-    if researchgate_data:
-        print(f"Removing duplicates from ResearchGate data...")
-        researchgate_deduped = remove_duplicates(researchgate_data)
-        all_scraped_data.extend(researchgate_deduped)
-
-    # Log data into MongoDB with nested structure
-    print(f"Logging data into MongoDB with nested source structure...")
-    log_nested_data(all_scraped_data)
-
-    print("Scraping and logging process completed successfully!")
+    process_logs_and_summarize()
